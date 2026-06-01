@@ -90,6 +90,9 @@ let readingMediaStream = null;
 let readingAudioContext = null;
 let readingAnalyser = null;
 let readingAudioData = null;
+let readingRecorder = null;
+let readingRecorderMimeType = "";
+let readingRecordedChunks = [];
 let readingMicLevelActive = false;
 let readingIsCurrentlySpeaking = false;
 let readingSilenceStartedAt = 0;
@@ -128,7 +131,7 @@ let eyeLiveTraceState = {
 let eyeTestState = {
   active: false,
   roundIndex: 0,
-  totalRounds: 8,
+  totalRounds: 20,
   roundTypes: [],
   results: [],
   startedAt: 0,
@@ -168,23 +171,23 @@ const THERAPY_DIFFICULTY_BONUS = {
 const EYE_PRESETS = {
   letters: {
     label: "Alphabet Match",
-    description: "Find the matching letter quickly. Best for a simple classroom-ready attention check.",
+    description: "Find the matching letter quickly across 20 rounds for a more reliable classroom attention check.",
     targetResponseMs: 2200,
-    totalRounds: 8,
+    totalRounds: 20,
     symbolPool: ["A", "B", "D", "E", "F", "H", "K", "M", "N", "P", "R", "S", "T", "Y"],
   },
   digits: {
     label: "Digit Match",
-    description: "Find the matching number. Useful for a low-language visual speed check.",
+    description: "Find the matching number across 20 rounds for a steadier low-language visual speed check.",
     targetResponseMs: 1900,
-    totalRounds: 8,
+    totalRounds: 20,
     symbolPool: ["2", "3", "4", "5", "6", "7", "8", "9"],
   },
   mixed: {
     label: "Mixed Symbols",
-    description: "A slightly harder mode with letters and digits mixed together.",
+    description: "A harder 24-round mode with letters and digits mixed together for a more meaningful consistency pattern.",
     targetResponseMs: 2400,
-    totalRounds: 10,
+    totalRounds: 24,
     symbolPool: ["A", "C", "E", "H", "K", "M", "P", "R", "3", "4", "5", "7", "8", "9"],
     letterPool: ["A", "C", "E", "H", "K", "M", "P", "R"],
     digitPool: ["3", "4", "5", "7", "8", "9"],
@@ -418,9 +421,55 @@ const BENGALI_LISTENING_FALLBACK = [
 
 const n = (id) => Number(document.getElementById(id).value || 0);
 const loadRecords = () => JSON.parse(localStorage.getItem(storeKey) || "[]");
+const RECORD_DUPLICATE_WINDOW_MS = 3000;
+const RECORD_REPEAT_WINDOW_MS = 30 * 60 * 1000;
+
+function stableSerializeRecord(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerializeRecord(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableSerializeRecord(value[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 const saveRecord = (entry) => {
   const records = loadRecords();
-  records.push({ ...entry, timestamp: new Date().toISOString() });
+  const now = new Date();
+  const lastRecord = records[records.length - 1];
+  const incomingFingerprint = stableSerializeRecord(entry);
+  if (lastRecord) {
+    const { timestamp: _lastTimestamp, ...lastEntry } = lastRecord;
+    const lastFingerprint = stableSerializeRecord(lastEntry);
+    const lastSavedAt = Date.parse(lastRecord.timestamp || "");
+    if (
+      Number.isFinite(lastSavedAt) &&
+      (now.getTime() - lastSavedAt) <= RECORD_DUPLICATE_WINDOW_MS &&
+      lastFingerprint === incomingFingerprint
+    ) {
+      return;
+    }
+  }
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const existingRecord = records[index];
+    if (!existingRecord || existingRecord.type !== entry.type) continue;
+    const existingSavedAt = Date.parse(existingRecord.timestamp || "");
+    if (
+      Number.isFinite(existingSavedAt) &&
+      (now.getTime() - existingSavedAt) > RECORD_REPEAT_WINDOW_MS
+    ) {
+      break;
+    }
+    const { timestamp: _existingTimestamp, ...existingEntry } = existingRecord;
+    if (stableSerializeRecord(existingEntry) === incomingFingerprint) {
+      return;
+    }
+  }
+  records.push({ ...entry, timestamp: now.toISOString() });
   localStorage.setItem(storeKey, JSON.stringify(records));
   renderRecords();
 };
@@ -1015,6 +1064,89 @@ function maybeAutoRunScreening() {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function buildLiveScreeningSnapshot() {
+  const readingScore = clamp(Number(readingTestState.score || 0), 0, 100);
+  const audioScore = clamp(Number(audioFeatures.comprehensionScore || 0) * 100, 0, 100);
+  const spellingTotal = Math.max(1, Number(spellingFeatures.total || 0));
+  const spellingErrors = Math.max(0, Number(spellingFeatures.errors || 0));
+  const spellingCorrect = Math.max(0, spellingTotal - spellingErrors);
+  const spellingScore = clamp((spellingCorrect / spellingTotal) * 100, 0, 100);
+  const pronunciationErrors = Math.max(0, Number(audioFeatures.pronunciationProxy || 0));
+  const readingTimeSeconds = Math.max(0, Number(readingTestState.seconds || 0));
+  const hesitationCount = Math.max(0, Number(readingTestState.hesitations || 0));
+  const repetitionCount = Math.max(0, Math.round((1 - Number(audioFeatures.comprehensionScore || 0)) * 4));
+  const omissionCount = Math.max(0, Math.round((readingTimeSeconds > 45 ? 2 : 0) + (hesitationCount > 4 ? 1 : 0) + ((audioFeatures.reloadCount || 0) > 0 ? 1 : 0)));
+  const readingWpm = Math.max(0, Number(readingTestState.wpm || 0));
+  const segmentOverallScore = (readingScore + audioScore + spellingScore) / 3;
+  return {
+    readingScore,
+    audioScore,
+    spellingScore,
+    segmentOverallScore,
+    spellingErrors,
+    spellingCorrect,
+    spellingTotal,
+    pronunciationErrors,
+    readingTimeSeconds,
+    hesitationCount,
+    repetitionCount,
+    omissionCount,
+    readingWpm,
+    reloadCount: Math.max(0, Number(audioFeatures.reloadCount || 0)),
+    wrongAttempts: Math.max(0, Number(audioFeatures.wrongAttempts || 0)),
+    listeningEfficiency: clamp(Number(audioFeatures.comprehensionScore || 0), 0, 1),
+  };
+}
+
+function scoreScreeningFromLiveData(language) {
+  const snapshot = buildLiveScreeningSnapshot();
+  const readingRisk = (100 - snapshot.readingScore) / 100;
+  const audioRisk = (100 - snapshot.audioScore) / 100;
+  const spellingRisk = (100 - snapshot.spellingScore) / 100;
+  const paceRisk = clamp(Math.abs(snapshot.readingWpm - 65) / 65, 0, 1);
+  const timingRisk = clamp(Math.max(0, snapshot.readingTimeSeconds - 35) / 40, 0, 1);
+  const pronunciationRisk = clamp(snapshot.pronunciationErrors / 5, 0, 1);
+  const hesitationRisk = clamp(snapshot.hesitationCount / 8, 0, 1);
+  const repetitionRisk = clamp(snapshot.repetitionCount / 4, 0, 1);
+  const omissionRisk = clamp(snapshot.omissionCount / 4, 0, 1);
+  const reloadRisk = clamp(snapshot.reloadCount / 3, 0, 1);
+  const wrongAttemptRisk = clamp(snapshot.wrongAttempts / 3, 0, 1);
+  const segmentRisk = (readingRisk * 0.38) + (audioRisk * 0.32) + (spellingRisk * 0.30);
+  const behaviorRisk = clamp(
+    (pronunciationRisk * 0.20) +
+    (hesitationRisk * 0.18) +
+    (repetitionRisk * 0.12) +
+    (omissionRisk * 0.18) +
+    (timingRisk * 0.12) +
+    (paceRisk * 0.08) +
+    (reloadRisk * 0.06) +
+    (wrongAttemptRisk * 0.06),
+    0,
+    1,
+  );
+  const segmentSpread = Math.max(snapshot.readingScore, snapshot.audioScore, snapshot.spellingScore)
+    - Math.min(snapshot.readingScore, snapshot.audioScore, snapshot.spellingScore);
+  const agreementBonus = clamp(1 - (segmentSpread / 45), 0, 1);
+  const combinedRisk = clamp((segmentRisk * 0.72) + (behaviorRisk * 0.28) - (agreementBonus * 0.04), 0, 1);
+  const mildRaw = Math.exp(-(((combinedRisk - 0.14) ** 2) / (2 * (0.13 ** 2))));
+  const moderateRaw = Math.exp(-(((combinedRisk - 0.50) ** 2) / (2 * (0.16 ** 2))));
+  const severeRaw = Math.exp(-(((combinedRisk - 0.84) ** 2) / (2 * (0.14 ** 2))));
+  const rawProbabilities = [mildRaw, moderateRaw, severeRaw];
+  const sum = rawProbabilities.reduce((total, value) => total + value, 0) || 1;
+  const probabilities = rawProbabilities.map((value) => value / sum);
+  const labels = ["Mild", "Moderate", "Severe"];
+  const maxIndex = probabilities.indexOf(Math.max(...probabilities));
+  return {
+    ...snapshot,
+    language,
+    label: labels[maxIndex],
+    confidence: probabilities[maxIndex],
+    probabilities,
+    combinedRisk,
+    severityScore: combinedRisk * 10,
+  };
 }
 
 function summarizeRecord(record) {
@@ -1936,6 +2068,7 @@ function renderRecordDetail(record) {
     return;
   }
   const meta = getRecordStatusMeta(record);
+  const eyeConsistencyScore = record?.stabilityScore ?? record?.consistencyScore;
   const detailRows = [];
   if (record.type === "screening") {
     detailRows.push(["Language", record.language || "-"]);
@@ -1952,7 +2085,7 @@ function renderRecordDetail(record) {
     detailRows.push(["Items Per Minute", `${Number(record.wpm || 0).toFixed(1)} IPM`]);
     detailRows.push(["Wrong Taps", record.regressions ?? "-"]);
     detailRows.push(["First-Try Accuracy", record.fixationScore !== undefined ? `${Number(record.fixationScore).toFixed(1)}%` : "-"]);
-    detailRows.push(["Consistency", record.stabilityScore !== undefined ? `${Number(record.stabilityScore).toFixed(1)}%` : "-"]);
+    detailRows.push(["Consistency", eyeConsistencyScore !== undefined ? `${Number(eyeConsistencyScore).toFixed(1)}%` : "-"]);
     detailRows.push(["Overall Status", record.eyeStatus || "-"]);
   } else if (record.type === "biomarkers") {
     detailRows.push(["Samples Analyzed", String(record.analyzed_samples || 0)]);
@@ -2302,7 +2435,6 @@ function updateSegmentScoreMatrix() {
   const spellingScore = spellingFeatures.scored && spellingFeatures.total
     ? (spellingCorrect / spellingFeatures.total) * 100
     : null;
-
   const readingMeta = getStatusMeta(readingScore, READING_PASS_THRESHOLD, readingTestState.done);
   const audioMeta = getStatusMeta(audioScore, AUDIO_PASS_THRESHOLD, audioFeatures.analyzed);
   const spellingMeta = getStatusMeta(spellingScore, SPELLING_PASS_THRESHOLD, spellingFeatures.scored);
@@ -2383,9 +2515,14 @@ READING_PROMPTS.Bengali = [
   "প্রতিদিন নিয়ম করে পড়ার অভ্যাস করলে আত্মবিশ্বাস বাড়ে এবং পড়া সহজ লাগে।",
 ];
 
-function finalizeReadingSession() {
+function finalizeReadingSession(transcription = null) {
   if (!readingTestState.startedAt || readingTestState.done) return;
   readingRecognitionRunning = false;
+  const transcriptText = String(transcription?.text || "").trim();
+  if (transcriptText) {
+    readingCurrentTranscript = transcriptText;
+    readingTestState.wordsSpoken = countTranscriptWords(transcriptText);
+  }
   readingTestState.seconds = Math.max(0, (performance.now() - readingTestState.startedAt) / 1000);
   readingTestState.done = true;
   const promptWords = (document.getElementById("readingPrompt")?.value || "").trim().split(/\s+/).filter(Boolean).length || 1;
@@ -2412,7 +2549,11 @@ function finalizeReadingSession() {
     resultNode.className = score >= READING_PASS_THRESHOLD ? "text-success fw-semibold" : "text-danger fw-semibold";
   }
   updateSegmentScoreMatrix();
-  const transcriptNote = spokenWords > 0 ? "" : " (fallback scoring: partial/no transcript)";
+  const transcriptNote = transcriptText
+    ? ` (${transcription?.engine || "local transcript"})`
+    : spokenWords > 0
+      ? ""
+      : " (fallback scoring: partial/no transcript)";
   document.getElementById("readingTestStatus").textContent =
     `Completed${transcriptNote}. Duration: ${readingTestState.seconds.toFixed(1)}s, Auto hesitations: ${readingTestState.hesitations}, WPM: ${wpm.toFixed(1)}, Reading score: ${score.toFixed(1)}%`;
   maybeAutoRunScreening();
@@ -2427,6 +2568,14 @@ function normalizeToken(token) {
 function lastSpokenWord() {
   const tokens = (readingCurrentTranscript || "").split(/\s+/).map(normalizeToken).filter(Boolean);
   return tokens.length ? tokens[tokens.length - 1] : "";
+}
+
+function countTranscriptWords(transcript) {
+  return (transcript || "")
+    .split(/\s+/)
+    .map(normalizeToken)
+    .filter(Boolean)
+    .length;
 }
 
 function extractPromptWords(promptText) {
@@ -2510,6 +2659,70 @@ async function startLocalMicMonitor() {
   }
 }
 
+function resetReadingRecorderState() {
+  readingRecorder = null;
+  readingRecorderMimeType = "";
+  readingRecordedChunks = [];
+}
+
+function startReadingRecorder() {
+  resetReadingRecorderState();
+  if (!readingMediaStream || typeof MediaRecorder === "undefined") return false;
+  const mimeCandidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  const mimeType = mimeCandidates.find((candidate) => MediaRecorder.isTypeSupported?.(candidate)) || "";
+  try {
+    readingRecorder = mimeType
+      ? new MediaRecorder(readingMediaStream, { mimeType })
+      : new MediaRecorder(readingMediaStream);
+    readingRecorderMimeType = mimeType || readingRecorder.mimeType || "audio/webm";
+    readingRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        readingRecordedChunks.push(event.data);
+      }
+    };
+    readingRecorder.start(250);
+    return true;
+  } catch (_err) {
+    resetReadingRecorderState();
+    return false;
+  }
+}
+
+function stopReadingRecorderAndCollect() {
+  return new Promise((resolve) => {
+    if (!readingRecorder) {
+      resolve(null);
+      return;
+    }
+    const activeRecorder = readingRecorder;
+    const finalizeBlob = () => {
+      if (!readingRecordedChunks.length) {
+        resetReadingRecorderState();
+        resolve(null);
+        return;
+      }
+      const blob = new Blob(readingRecordedChunks, { type: readingRecorderMimeType || activeRecorder.mimeType || "audio/webm" });
+      resetReadingRecorderState();
+      resolve(blob);
+    };
+    activeRecorder.onstop = finalizeBlob;
+    if (activeRecorder.state === "inactive") {
+      finalizeBlob();
+      return;
+    }
+    try {
+      activeRecorder.stop();
+    } catch (_err) {
+      finalizeBlob();
+    }
+  });
+}
+
 function stopLocalMicMonitor() {
   readingMicLevelActive = false;
   readingSpeechStartedAt = 0;
@@ -2524,6 +2737,26 @@ function stopLocalMicMonitor() {
     try { readingAudioContext.close(); } catch (_err) {}
   }
   readingAudioContext = null;
+}
+
+async function transcribeReadingAudio(blob) {
+  if (!blob || !blob.size) return null;
+  const language = document.getElementById("sampleLanguage")?.value || "Bengali";
+  const extension = blob.type && blob.type.includes("ogg") ? ".ogg" : blob.type && blob.type.includes("mp4") ? ".mp4" : ".webm";
+  const response = await fetch("/api/reading-transcribe", {
+    method: "POST",
+    headers: {
+      "Content-Type": blob.type || "application/octet-stream",
+      "X-Reading-Language": language,
+      "X-Audio-Filename": `reading${extension}`,
+    },
+    body: blob,
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(payload?.error || "Local transcription failed.");
+  }
+  return payload;
 }
 
 function sampleMicActivity() {
@@ -2645,6 +2878,7 @@ document.getElementById("startReadingTest")?.addEventListener("click", async () 
   startReadingMonitor();
   readingRecognitionRunning = true;
   readingOfflineMode = true;
+  startReadingRecorder();
   document.getElementById("readingTestStatus").textContent = "Microphone connected. Listening is active. Click Stop when you finish reading.";
 });
 
@@ -2652,7 +2886,7 @@ document.getElementById("markHesitation")?.addEventListener("click", () => {
   document.getElementById("readingTestStatus").textContent = "Manual hesitation is disabled. Use Start/Stop for automatic detection.";
 });
 
-document.getElementById("stopReadingTest")?.addEventListener("click", () => {
+document.getElementById("stopReadingTest")?.addEventListener("click", async () => {
   if (!readingTestState.startedAt || readingTestState.done) return;
   readingStopRequested = true;
   clearReadingAutoFinalizeTimer();
@@ -2662,9 +2896,20 @@ document.getElementById("stopReadingTest")?.addEventListener("click", () => {
     try { readingRecognition.stop(); } catch (_err) {}
   }
   stopReadingMonitor();
+  document.getElementById("readingTestStatus").textContent = "Stopping capture and preparing the reading score...";
+  const recordedAudio = await stopReadingRecorderAndCollect();
   stopLocalMicMonitor();
   setReadingListeningUI(false);
-  finalizeReadingSession();
+  let transcription = null;
+  if (recordedAudio) {
+    document.getElementById("readingTestStatus").textContent = "Transcribing the reading sample locally with Whisper...";
+    try {
+      transcription = await transcribeReadingAudio(recordedAudio);
+    } catch (error) {
+      document.getElementById("readingTestStatus").textContent = `${error.message} Falling back to timing-based reading scoring.`;
+    }
+  }
+  finalizeReadingSession(transcription);
 });
 
 document.getElementById("scoreSpellingTest")?.addEventListener("click", scoreSpellingTestNow);
@@ -3341,26 +3586,17 @@ document.getElementById("runScreening").addEventListener("click", () => {
     return;
   }
   const language = document.getElementById("sampleLanguage").value;
-  const spelling = spellingFeatures.errors;
-  const pron = audioFeatures.pronunciationProxy;
-  const time = readingTestState.seconds;
-  const hes = readingTestState.hesitations;
-  const rep = Math.max(0, Math.round((1 - audioFeatures.comprehensionScore) * 4));
-  const omi = Math.max(0, Math.round((time > 45 ? 2 : 0) + (hes > 4 ? 1 : 0) + (audioFeatures.reloadCount > 0 ? 1 : 0)));
-
-  const severityScore = (pron * 0.9) + (spelling * 0.8) + (hes * 0.7) + (rep * 0.55) + (omi * 0.9) + (time / 25);
-  const probabilities = [
-    Math.max(0.02, 1.15 - (severityScore / 7)),
-    Math.max(0.02, 0.55 + (severityScore / 12)),
-    Math.max(0.02, -0.2 + (severityScore / 8)),
-  ];
-  const sum = probabilities.reduce((a, b) => a + b, 0);
-  const norm = probabilities.map((p) => p / sum);
-
-  const labels = ["Mild", "Moderate", "Severe"];
-  const maxIndex = norm.indexOf(Math.max(...norm));
-  const label = labels[maxIndex];
-  const confidence = norm[maxIndex];
+  const screening = scoreScreeningFromLiveData(language);
+  const spelling = screening.spellingErrors;
+  const pron = screening.pronunciationErrors;
+  const time = screening.readingTimeSeconds;
+  const hes = screening.hesitationCount;
+  const rep = screening.repetitionCount;
+  const omi = screening.omissionCount;
+  const severityScore = screening.severityScore;
+  const norm = screening.probabilities;
+  const label = screening.label;
+  const confidence = screening.confidence;
   const riskTone = label === "Mild" ? "low-to-moderate" : label === "Moderate" ? "moderate" : "high";
 
   const teacher = `Classroom view: ${riskTone} support need. Focus on structured decoding, short fluency rounds, and monitored repetition.`;
@@ -3376,6 +3612,7 @@ document.getElementById("runScreening").addEventListener("click", () => {
     <p><strong>Language:</strong> ${language}</p>
     <p><strong>Predicted Severity:</strong> ${label}</p>
     <p><strong>Confidence:</strong> ${(confidence * 100).toFixed(1)}%</p>
+    <p><strong>Segment Evidence:</strong> Reading ${screening.readingScore.toFixed(1)}%, Audio ${screening.audioScore.toFixed(1)}%, Spelling ${screening.spellingScore.toFixed(1)}%</p>
     <p>${teacher}</p>
     <p>${parent}</p>
     <p>${student}</p>
@@ -3398,6 +3635,9 @@ document.getElementById("runScreening").addEventListener("click", () => {
     confidence,
     severityScore,
       auto_features: {
+        reading_score: screening.readingScore,
+        audio_score: screening.audioScore,
+        spelling_score: screening.spellingScore,
         spelling_errors: spelling,
         pronunciation_errors: pron,
         reading_time_seconds: time,
@@ -3409,7 +3649,7 @@ document.getElementById("runScreening").addEventListener("click", () => {
         wrong_attempts: audioFeatures.wrongAttempts,
       },
   });
-  latestScreening = { label, confidence, severityScore, language };
+  latestScreening = { label, confidence, severityScore, language, readingScore: screening.readingScore, audioScore: screening.audioScore, spellingScore: screening.spellingScore };
   markReportSourceChanged("Screening");
   updateTestLabStatus();
 });
